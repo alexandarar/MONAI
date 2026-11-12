@@ -1,0 +1,281 @@
+# Copyright (c) MONAI Consortium
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import unittest
+from itertools import product
+
+import numpy as np
+import torch
+from parameterized import parameterized
+
+from monai.metrics import HausdorffDistanceMetric
+from monai.metrics.hausdorff_distance import _compute_percentile_hausdorff_distance
+
+_devices = ["cpu"]
+if torch.cuda.is_available():
+    _devices.append("cuda")
+
+
+def create_spherical_seg_3d(
+    radius: float = 20.0,
+    centre: tuple[int, int, int] = (49, 49, 49),
+    im_shape: tuple[int, int, int] = (99, 99, 99),
+    im_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> np.ndarray:
+    """
+    Return a 3D image with a sphere inside. Voxel values will be
+    1 inside the sphere, and 0 elsewhere.
+
+    Args:
+        radius: radius of sphere (in terms of number of voxels, can be partial)
+        centre: location of sphere centre.
+        im_shape: shape of image to create.
+        im_spacing: spacing of image to create.
+
+    See also:
+        :py:meth:`~create_test_image_3d`
+    """
+    # Create image
+    image = np.zeros(im_shape, dtype=np.int32)
+    spy, spx, spz = np.ogrid[: im_shape[0], : im_shape[1], : im_shape[2]]
+    spy = spy.astype(float) * im_spacing[0]
+    spx = spx.astype(float) * im_spacing[1]
+    spz = spz.astype(float) * im_spacing[2]
+
+    spy -= centre[0]
+    spx -= centre[1]
+    spz -= centre[2]
+
+    circle = (spx * spx + spy * spy + spz * spz) <= radius * radius
+
+    image[circle] = 1
+    image[~circle] = 0
+    return image
+
+
+test_spacing = (0.85, 1.2, 0.9)
+TEST_CASES = [
+    [[create_spherical_seg_3d(), create_spherical_seg_3d(), None, 1], [0, 0, 0, 0, 0, 0]],
+    [
+        [
+            create_spherical_seg_3d(radius=20, centre=(20, 20, 20)),
+            create_spherical_seg_3d(radius=20, centre=(19, 19, 19)),
+            None,
+        ],
+        [1.7320508075688772, 1.7320508075688772, 1, 1, 3, 3],
+    ],
+    [
+        [
+            create_spherical_seg_3d(radius=33, centre=(19, 33, 22)),
+            create_spherical_seg_3d(radius=33, centre=(20, 33, 22)),
+            None,
+        ],
+        [1, 1, 1, 1, 1, 1],
+    ],
+    [
+        [
+            create_spherical_seg_3d(radius=20, centre=(20, 33, 22)),
+            create_spherical_seg_3d(radius=40, centre=(20, 33, 22)),
+            None,
+        ],
+        [20.09975124224178, 20.223748416156685, 15, 20, 24, 35],
+    ],
+    [
+        [
+            # pred does not have foreground (but gt has), the metric should be inf
+            np.zeros([99, 99, 99]),
+            create_spherical_seg_3d(radius=40, centre=(20, 33, 22)),
+            None,
+        ],
+        [np.inf, np.inf, np.inf, np.inf, np.inf, np.inf],
+    ],
+    [
+        [
+            # gt does not have foreground (but pred has), the metric should be inf
+            create_spherical_seg_3d(),
+            np.zeros([99, 99, 99]),
+            None,
+        ],
+        [np.inf, np.inf, np.inf, np.inf, np.inf, np.inf],
+    ],
+    [
+        [
+            create_spherical_seg_3d(radius=20, centre=(20, 33, 22)),
+            create_spherical_seg_3d(radius=40, centre=(20, 33, 22)),
+            None,
+            95,
+        ],
+        [19.924858845171276, 20.09975124224178, 14, 18, 22, 33],
+    ],
+    [
+        [
+            # percentile=0 is the 0th-percentile (minimum) surface distance, not the max
+            create_spherical_seg_3d(radius=20, centre=(20, 20, 20)),
+            create_spherical_seg_3d(radius=20, centre=(19, 19, 19)),
+            None,
+            0,
+        ],
+        [0, 0, 0, 0, 0, 0],
+    ],
+    [
+        [
+            create_spherical_seg_3d(radius=15, centre=(20, 33, 22), im_spacing=test_spacing),
+            create_spherical_seg_3d(radius=30, centre=(20, 33, 22), im_spacing=test_spacing),
+            test_spacing,
+            0,
+        ],
+        [5.099999904632568, 5.099999904632568, 6, 6, 6, 6],
+    ],
+    [
+        [
+            create_spherical_seg_3d(radius=20, centre=(20, 20, 20), im_spacing=test_spacing),
+            create_spherical_seg_3d(radius=20, centre=(19, 19, 19), im_spacing=test_spacing),
+            test_spacing,
+        ],
+        [2.0808651447296143, 2.2671568, 2, 2, 3, 4],
+    ],
+    [
+        [
+            create_spherical_seg_3d(radius=15, centre=(20, 33, 22), im_spacing=test_spacing),
+            create_spherical_seg_3d(radius=30, centre=(20, 33, 22), im_spacing=test_spacing),
+            test_spacing,
+        ],
+        [15.439640998840332, 15.62594, 11, 17, 20, 28],
+    ],
+]
+
+TEST_CASES_NANS = [
+    [
+        [
+            # both pred and gt do not have foreground, spacing is None, metric and not_nans should be 0
+            np.zeros([99, 99, 99]),
+            np.zeros([99, 99, 99]),
+            None,
+        ]
+    ],
+    [
+        [
+            # both pred and gt do not have foreground, metric and not_nans should be 0
+            np.zeros([99, 99, 99]),
+            np.zeros([99, 99, 99]),
+            test_spacing,
+        ]
+    ],
+]
+
+# An empty prediction against a non-empty ground truth: every surface distance is
+# infinite, and the reported distance must stay infinite whatever percentile is asked
+# for. NaN is reserved for the case where there is no structure on either side.
+TEST_CASES_EMPTY_PREDICTION = [[None], [0], [50], [95], [99], [100]]
+
+TEST_CASES_EXPANDED = []
+for test_case in TEST_CASES:
+    test_output: list[float | int]
+    test_input, test_output = test_case  # type: ignore
+    for _device in _devices:
+        for i, (metric, directed) in enumerate(product(["euclidean", "chessboard", "taxicab"], [True, False])):
+            TEST_CASES_EXPANDED.append((_device, metric, directed, test_input, test_output[i]))
+
+
+def _describe_test_case(test_func, test_number, params):
+    _device, metric, directed, test_input, test_output = params.args
+    return f"device: {_device} metric: {metric} directed:{directed} expected: {test_output}"
+
+
+TEST_CASES_PERCENTILE = [
+    [[0.0, 3.0], None, 3.0],
+    [[0.0, 3.0], 0, 0.0],
+    [[np.inf, np.inf, np.inf], 0, np.inf],
+    [[1.0, 2.0, 3.0], 50, 2.0],
+    [[], 0, np.nan],
+]
+
+
+class TestHausdorffDistance(unittest.TestCase):
+
+    @parameterized.expand(TEST_CASES_EXPANDED, doc_func=_describe_test_case)
+    def test_value(self, device, metric, directed, input_data, expected_value):
+        percentile = None
+        if len(input_data) == 4:
+            [seg_1, seg_2, spacing, percentile] = input_data
+        else:
+            [seg_1, seg_2, spacing] = input_data
+
+        seg_1 = torch.tensor(seg_1, device=device)
+        seg_2 = torch.tensor(seg_2, device=device)
+        hd_metric = HausdorffDistanceMetric(
+            include_background=False, distance_metric=metric, percentile=percentile, directed=directed
+        )
+        # shape of seg_1, seg_2 are: HWD, converts to BNHWD
+        batch, n_class = 2, 3
+        batch_seg_1 = seg_1.unsqueeze(0).unsqueeze(0).repeat([batch, n_class, 1, 1, 1])
+        batch_seg_2 = seg_2.unsqueeze(0).unsqueeze(0).repeat([batch, n_class, 1, 1, 1])
+        hd_metric(batch_seg_1, batch_seg_2, spacing=spacing)
+        result: torch.Tensor = hd_metric.aggregate(reduction="mean")  # type: ignore
+        np.testing.assert_allclose(expected_value, result.cpu(), rtol=1e-6)
+        np.testing.assert_equal(result.device, seg_1.device)
+
+    @parameterized.expand(TEST_CASES_NANS)
+    def test_nans(self, input_data):
+        [seg_1, seg_2, spacing] = input_data
+        seg_1 = torch.tensor(seg_1)
+        seg_2 = torch.tensor(seg_2)
+        hd_metric = HausdorffDistanceMetric(include_background=False, get_not_nans=True)
+        batch_seg_1 = seg_1.unsqueeze(0).unsqueeze(0)
+        batch_seg_2 = seg_2.unsqueeze(0).unsqueeze(0)
+        hd_metric(batch_seg_1, batch_seg_2, spacing=spacing)
+        result, not_nans = hd_metric.aggregate()
+        np.testing.assert_allclose(0, result, rtol=1e-7)
+        np.testing.assert_allclose(0, not_nans, rtol=1e-7)
+
+    @parameterized.expand(TEST_CASES_EMPTY_PREDICTION)
+    def test_empty_prediction_is_infinite(self, percentile):
+        """A prediction that misses the structure entirely scores `inf`, not NaN.
+
+        NaN is dropped by `do_metric_reduction`, so returning it here would take the
+        model's worst cases out of a dataset average rather than scoring them.
+        """
+        seg_gt = torch.tensor(create_spherical_seg_3d(radius=20, centre=(20, 20, 20)))
+        seg_pred = torch.zeros_like(seg_gt)
+        hd_metric = HausdorffDistanceMetric(include_background=True, percentile=percentile, get_not_nans=True)
+        hd_metric(seg_pred.unsqueeze(0).unsqueeze(0), seg_gt.unsqueeze(0).unsqueeze(0))
+        result, not_nans = hd_metric.aggregate()
+        self.assertTrue(torch.isinf(result).all(), f"expected inf, got {result}")
+        np.testing.assert_allclose(1, not_nans, rtol=1e-7)
+
+    @parameterized.expand(TEST_CASES_EMPTY_PREDICTION)
+    def test_all_infinite_surface_distance(self, percentile):
+        """The quantile of an all-infinite tensor is infinite, at every percentile.
+
+        `torch.quantile` interpolates between order statistics and returns NaN when the
+        two it interpolates between are both infinite.
+        """
+        surface_distance = torch.full((7,), float("inf"))
+        result = _compute_percentile_hausdorff_distance(surface_distance, percentile)
+        self.assertTrue(torch.isinf(result), f"expected inf, got {result}")
+
+    @parameterized.expand(TEST_CASES_PERCENTILE)
+    def test_percentile(self, surface_distances, percentile, expected_value):
+        surface_distance = torch.tensor(surface_distances, dtype=torch.float)
+        result = _compute_percentile_hausdorff_distance(surface_distance, percentile)
+        np.testing.assert_allclose(expected_value, result, rtol=1e-7)
+
+    def test_percentile_out_of_range(self):
+        for percentile in [-1, 101]:
+            with self.subTest(percentile=percentile):
+                with self.assertRaises(ValueError):
+                    _compute_percentile_hausdorff_distance(torch.tensor([1.0, 2.0, 3.0]), percentile)
+
+
+if __name__ == "__main__":
+    unittest.main()
